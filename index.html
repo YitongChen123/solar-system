@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>太阳系层级变换实验</title>
+<style>
+canvas {border:1px solid #333; background:#000;}
+.panel{color:#fff; background:#222; padding:8px; margin-bottom:8px;}
+</style>
+</head>
+<body style="background:#111;color:#fff;">
+<div class="panel">
+  <button id="btnPause">暂停</button>
+  <button id="btnProj">切换投影（当前：透视）</button>
+  <label>速度：<input type="range" id="speedSlider" min="0" max="3" step="0.1" value="1"></label>
+  <label>倾角：<input type="range" id="tiltSlider" min="0" max="90" step="1" value="20"></label>
+  <label><input type="checkbox" id="showOrbit" checked> 显示轨道线</label>
+</div>
+<canvas id="glcanvas" width="600" height="600"></canvas>
+
+<script>
+// ========== 原版 initShaders.js 内嵌 ==========
+function initShaders( gl, vertexShaderSource, fragmentShaderSource ){
+    var vshader = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vshader, vertexShaderSource);
+    gl.compileShader(vshader);
+    if(!gl.getShaderParameter(vshader, gl.COMPILE_STATUS)){
+        alert("顶点着色器编译失败："+gl.getShaderInfoLog(vshader));
+        return null;
+    }
+    var fshader = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fshader, fragmentShaderSource);
+    gl.compileShader(fshader);
+    if(!gl.getShaderParameter(fshader, gl.COMPILE_STATUS)){
+        alert("片元着色器编译失败："+gl.getShaderInfoLog(fshader));
+        return null;
+    }
+    var program = gl.createProgram();
+    gl.attachShader(program, vshader);
+    gl.attachShader(program, fshader);
+    gl.linkProgram(program);
+    if(!gl.getProgramParameter(program, gl.LINK_STATUS)){
+        alert("程序链接失败："+gl.getProgramInfoLog(program));
+        return null;
+    }
+    return program;
+}
+
+// ========== 原版 MV.js 内嵌（课程标准） ==========
+function mat4() { return [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]; }
+function flatten(a) { return new Float32Array(a); }
+function mult(a,b) {
+    let res = [];
+    for(let i=0;i<4;i++){
+        for(let j=0;j<4;j++){
+            res[i*4+j] = a[i*4+0]*b[0*4+j] + a[i*4+1]*b[1*4+j] + a[i*4+2]*b[2*4+j] + a[i*4+3]*b[3*4+j];
+        }
+    }
+    return res;
+}
+function translate(x,y,z){
+    return [1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1];
+}
+function rotate(angle, axis){
+    let rad = angle * Math.PI / 180;
+    let s = Math.sin(rad), c = Math.cos(rad);
+    let ux=axis[0],uy=axis[1],uz=axis[2];
+    return [
+        c+ux*ux*(1-c), uy*ux*(1-c)+uz*s, uz*ux*(1-c)-uy*s, 0,
+        ux*uy*(1-c)-uz*s, c+uy*uy*(1-c), uz*uy*(1-c)+ux*s, 0,
+        ux*uz*(1-c)+uy*s, uy*uz*(1-c)-ux*s, c+uz*uz*(1-c), 0,
+        0,0,0,1
+    ];
+}
+function lookAt(eye, at, up){
+    let f = normalize([at[0]-eye[0], at[1]-eye[1], at[2]-eye[2]]);
+    let u = normalize(up);
+    let s = normalize(cross(f,u));
+    u = cross(s,f);
+    return [
+        s[0],u[0],-f[0],0,
+        s[1],u[1],-f[1],0,
+        s[2],u[2],-f[2],0,
+        -dot(s,eye),-dot(u,eye),dot(f,eye),1
+    ];
+}
+function perspective(fovy, aspect, near, far){
+    let f = 1.0 / Math.tan(fovy*Math.PI/360);
+    return [
+        f/aspect,0,0,0,
+        0,f,0,0,
+        0,0,(far+near)/(near-far),-1,
+        0,0,2*far*near/(near-far),0
+    ];
+}
+function ortho(left,right,bottom,top,near,far){
+    return [
+        2/(right-left),0,0,0,
+        0,2/(top-bottom),0,0,
+        0,0,-2/(far-near),0,
+        -(right+left)/(right-left), -(top+bottom)/(top-bottom), -(far+near)/(far-near),1
+    ];
+}
+function normalize(v){
+    let len = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+    return [v[0]/len, v[1]/len, v[2]/len];
+}
+function cross(a,b){
+    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+}
+function dot(a,b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+
+// ==========【天体参数集中配置区】 ==========
+const CONFIG = {
+  sunRadius: 2.0,
+  planetRadius: 0.8,
+  moonRadius: 0.35,
+  planetOrbitR: 7.0,
+  moonOrbitR: 2.2,
+  sunCycle: 12,
+  planetCycle: 6,
+  moonCycle: 2,
+  initTilt: 20
+};
+
+let gl, program;
+let isPause = false;
+let usePerspective = true;
+let speedScale = 1.0;
+let tiltAngle = CONFIG.initTilt;
+let showOrbit = true;
+let startTime = Date.now();
+
+const vShaderSource = `
+attribute vec3 aPosition;
+attribute vec3 aColor;
+uniform mat4 uModelView;
+uniform mat4 uProjection;
+varying vec4 vColor;
+void main(){
+  gl_Position = uProjection * uModelView * vec4(aPosition, 1.0);
+  vColor = vec4(aColor, 1.0);
+}
+`;
+const fShaderSource = `
+precision mediump float;
+varying vec4 vColor;
+void main(){ gl_FragColor = vColor; }
+`;
+
+// 修改：支持传入颜色
+function sphere(radius, seg=24, color=[1,1,1]){
+  let pos=[],col=[],idx=[];
+  for(let lat=0;lat<=seg;lat++){
+    let theta = lat*Math.PI/seg;
+    let st = Math.sin(theta), ct = Math.cos(theta);
+    for(let lon=0;lon<=seg;lon++){
+      let phi = lon*2*Math.PI/seg;
+      let sp = Math.sin(phi), cp = Math.cos(phi);
+      pos.push(radius*cp*st, radius*ct, radius*sp*st);
+      col.push(...color);
+    }
+  }
+  for(let lat=0;lat<seg;lat++){
+    for(let lon=0;lon<seg;lon++){
+      let a = lat*(seg+1)+lon;
+      let b = a+1;
+      let c = a+seg+1;
+      let d = c+1;
+      idx.push(a,b,c, b,d,c);
+    }
+  }
+  return {pos,col,idx};
+}
+function ring(R, seg=48, color=[0.6,0.6,0.6]){
+  let pos=[],col=[];
+  for(let i=0;i<=seg;i++){
+    let ang = i*2*Math.PI/seg;
+    pos.push(R*Math.cos(ang),0,R*Math.sin(ang));
+    col.push(...color);
+  }
+  return {pos,col};
+}
+
+// 太阳：黄色，行星：蓝色，月球：浅灰
+let sunGeo = sphere(CONFIG.sunRadius, 24, [1,0.9,0.2]);
+let planetGeo = sphere(CONFIG.planetRadius,24, [0.2,0.5,1]);
+let moonGeo = sphere(CONFIG.moonRadius,24, [0.9,0.9,0.9]);
+let planetOrbitGeo = ring(CONFIG.planetOrbitR,48, [0.5,0.5,0.5]);
+let moonOrbitGeo = ring(CONFIG.moonOrbitR,48, [0.4,0.4,0.4]);
+
+function createBuffer(geo){
+  let vbuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(geo.pos), gl.STATIC_DRAW);
+  let cbuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, cbuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(geo.col), gl.STATIC_DRAW);
+  let ibuf = null;
+  if(geo.idx){
+    ibuf = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(geo.idx), gl.STATIC_DRAW);
+  }
+  return {vbuf,cbuf,ibuf,count:geo.pos.length/3, icount:geo.idx?geo.idx.length:0};
+}
+
+function drawMesh(buf, modelView, projMat, mode=gl.TRIANGLES){
+  gl.uniformMatrix4fv(gl.getUniformLocation(program,"uModelView"), false, flatten(modelView));
+  gl.uniformMatrix4fv(gl.getUniformLocation(program,"uProjection"), false, flatten(projMat));
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf.vbuf);
+  let aPos = gl.getAttribLocation(program,"aPosition");
+  gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+  gl.enableVertexAttribArray(aPos);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf.cbuf);
+  let aCol = gl.getAttribLocation(program,"aColor");
+  gl.vertexAttribPointer(aCol,3,gl.FLOAT,false,0,0);
+  gl.enableVertexAttribArray(aCol);
+
+  if(buf.ibuf){
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf.ibuf);
+    gl.drawElements(mode, buf.icount, gl.UNSIGNED_SHORT, 0);
+  }else{
+    gl.drawArrays(gl.LINE_LOOP,0,buf.count);
+  }
+}
+
+window.onload = function(){
+  const canvas = document.getElementById("glcanvas");
+  gl = canvas.getContext("webgl");
+  if(!gl) alert("不支持webgl");
+  program = initShaders(gl, vShaderSource, fShaderSource);
+  gl.useProgram(program);
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0,0,0,1);
+
+  let sunBuf = createBuffer(sunGeo);
+  let planetBuf = createBuffer(planetGeo);
+  let moonBuf = createBuffer(moonGeo);
+  let planetOrbitBuf = createBuffer(planetOrbitGeo);
+  let moonOrbitBuf = createBuffer(moonOrbitGeo);
+
+  document.getElementById("btnPause").onclick = ()=>{
+    isPause = !isPause;
+    document.getElementById("btnPause").innerText = isPause?"继续":"暂停";
+  }
+  document.getElementById("btnProj").onclick = ()=>{
+    usePerspective = !usePerspective;
+    document.getElementById("btnProj").innerText = "切换投影（当前："+(usePerspective?"透视":"正交")+")";
+  }
+  document.getElementById("speedSlider").oninput = e=> speedScale = Number(e.target.value);
+  document.getElementById("tiltSlider").oninput = e=> tiltAngle = Number(e.target.value);
+  document.getElementById("showOrbit").onchange = e=> showOrbit = e.target.checked;
+
+  function render(){
+    let now = Date.now();
+    let dt = (now-startTime)/1000;
+    if(isPause) dt = (Date.now()-startTime)/1000;
+    let t = dt * speedScale;
+
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    let view = lookAt([0,12,18], [0,0,0], [0,1,0]);
+    let proj;
+    if(usePerspective){
+      proj = perspective(45, canvas.width/canvas.height, 0.1, 100);
+    }else{
+      proj = ortho(-12,12,-12,12,0.1,100);
+    }
+
+    let sunRot = rotate(t*360/CONFIG.sunCycle, [0,1,0]);
+    let sunMv = mult(view, sunRot);
+    drawMesh(sunBuf, sunMv, proj);
+
+    let planetOrbitAng = t*360/CONFIG.planetCycle;
+    let planetTilt = rotate(tiltAngle, [1,0,0]);
+    let planetOrbitRot = rotate(planetOrbitAng, [0,1,0]);
+    let planetTrans = translate(CONFIG.planetOrbitR, 0, 0);
+    let planetSelfRot = rotate(t*360*1.5, [0,1,0]);
+    let planetMv = mult(view, mult(sunRot, mult(planetTilt, mult(planetOrbitRot, mult(planetTrans, planetSelfRot)))));
+    drawMesh(planetBuf, planetMv, proj);
+
+    if(showOrbit){
+      let orbitMv = mult(view, mult(sunRot, mult(planetTilt, planetOrbitRot)));
+      drawMesh(planetOrbitBuf, orbitMv, proj, gl.LINE_LOOP);
+    }
+
+    let moonOrbitAng = t*360/CONFIG.moonCycle;
+    let moonOrbitRot = rotate(moonOrbitAng, [0,1,0]);
+    let moonTrans = translate(CONFIG.moonOrbitR,0,0);
+    let moonSelfRot = rotate(t*400, [0,1,0]);
+    let moonMv = mult(view, mult(sunRot, mult(planetTilt, mult(planetOrbitRot, mult(planetTrans, mult(moonOrbitRot, mult(moonTrans, moonSelfRot)))))));
+    drawMesh(moonBuf, moonMv, proj);
+    if(showOrbit){
+      let moonOrbitMv = mult(view, mult(sunRot, mult(planetTilt, mult(planetOrbitRot, mult(planetTrans, moonOrbitRot)))));
+      drawMesh(moonOrbitBuf, moonOrbitMv, proj, gl.LINE_LOOP);
+    }
+    requestAnimationFrame(render);
+  }
+  requestAnimationFrame(render);
+}
+</script>
+</body>
+</html>
